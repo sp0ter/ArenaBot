@@ -4,74 +4,247 @@ import re
 import logging
 from dotenv import load_dotenv
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import asyncio
+import traceback
 
-# Налаштування логування
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
+# Настройка логирования
+logger = logging.getLogger('discord')
+logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler('bot.log', encoding='utf-8', mode='a')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.handlers = [file_handler, console_handler]
 
-# Завантаження змінних середовища з .env файлу
+# Загрузка переменных окружения
 load_dotenv()
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
+GOOGLE_SHEET_NAME = os.getenv('GOOGLE_SHEET_NAME')
+GOOGLE_CREDENTIALS_FILE = os.getenv('GOOGLE_CREDENTIALS_FILE')
 
-# Конфігурація
-TOKEN = os.getenv('DISCORD_BOT_TOKEN')  # Токен бота з .env
-CHANNEL_ID = int(os.getenv('CHANNEL_ID'))  # ID каналу з .env
+# Настройка Google Sheets
+SCOPE = ['https://www.googleapis.com/auth/drive',
+         'https://www.googleapis.com/auth/spreadsheets']
+creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, SCOPE)
+client = gspread.authorize(creds)
+sheet = client.open(GOOGLE_SHEET_NAME).sheet1
 
-# Налаштування інтентів
+# Discord бот
 intents = discord.Intents.default()
-intents.message_content = True  # Для читання вмісту повідомлень
-intents.messages = True  # Для обробки подій повідомлень
-
-# Ініціалізація бота
+intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Заголовки таблицы
+HEADERS = ['Дата', 'Пользователь', 'Тикер', 'Ссылка на пост',
+           'Риск', 'Entry', 'SL', 'TP', 'Результат', 'XP', 'Символ', 'Голоса Так']
+
+def extract_xp(content: str):
+    pattern = r'\b(win|lose|be)\s*([+-]?\d*[.,]?\d*)\s*\$'
+    match = re.search(pattern, content, re.I)
+    if match:
+        op, num = match.group(1).lower(), match.group(2).replace(',', '.')
+        val = float(num) if num and num != '0' else 0.0
+        if op == 'lose' and val > 0: val = -val
+        if op == 'be': val = 0.0
+        return val, '$'
+    # наличие ключевого слова без $
+    if re.search(r'\b(win|lose|be)\s*[+-]?\d*[.,]?\d*\b', content, re.I):
+        return 'NO_DOLLAR', None
+    return None, None
+
+def extract_ticker(content: str):
+    first = content.strip().split('\n')[0].split()[0]
+    stop = {'risk','риск','entry','твх','sl','stop','стоп','tp','тп','stoploss','стоплосс'}
+    return first.upper() if first.lower() not in stop else 'Не указан'
+
+def extract_param(content, keys):
+    pat = r'(' + '|'.join(keys) + r')[\s:=-]*([\d.,]+)'
+    m = re.search(pat, content, re.I)
+    return m.group(2) if m else 'Не указан'
+
+extract_risk  = lambda c: extract_param(c, ['risk','риск'])
+extract_entry = lambda c: extract_param(c, ['entry','твх'])
+extract_sl    = lambda c: extract_param(c, ['sl','stop','стоп','stoploss','стоплосс'])
+extract_tp    = lambda c: extract_param(c, ['tp','тп'])
+
+def ensure_headers(ws):
+    if ws.row_values(1) != HEADERS:
+        ws.insert_row(HEADERS, 1)
+
+def on_message_message_error_cleanup(msg):
+    # При обработке ошибок просто логируем
+    logger.error(f'Ошибка в on_message для {msg.id}')
 
 @bot.event
 async def on_ready():
-    logging.info(f'Бот {bot.user} підключений і готовий до роботи!')
+    ensure_headers(sheet)
+    logger.info(f'{bot.user} запущен.')
 
 @bot.event
-async def on_message(message):
-    # Ігноруємо повідомлення від ботів і повідомлення поза вказаним каналом
-    if message.author.bot or message.channel.id != CHANNEL_ID:
-        return
+async def on_message(msg: discord.Message):
+    try:
+        # Игнорируем собственные боты и другие каналы
+        if msg.author.bot or msg.channel.id != CHANNEL_ID:
+            return
+        # Сначала обрабатываем команды
+        if msg.content.startswith('!'):
+            await bot.process_commands(msg)
+            return
 
-    # Пошук слова "win" у повідомленні (ігноруємо регістр)
-    if re.search(r'\bwin\b', message.content, re.IGNORECASE):
-        logging.info(f'Виявлено слово "win" у повідомленні {message.id} від {message.author}')
-        try:
-            # Створення опросу
-            poll = discord.Poll(
-                question="Ви заробили на цьому кейсі?",
-                duration=timedelta(days=3)  # 3 доби
+        # Подготовка переменных
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        link = f'https://discord.com/channels/{msg.guild.id}/{msg.channel.id}/{msg.id}'
+        xp, sym = extract_xp(msg.content)
+        low = msg.content.lower()
+        is_idea   = bool(re.search(r'\b(entry|твх|risk|риск)\b', low))
+        is_result = bool(re.search(r'\b(win|lose|be|close)\b', low))
+        is_update = bool(re.search(r'\bupdate\b', low))
+
+        # 1) Идея
+        if is_idea and not is_result and not is_update:
+            row = [now, msg.author.name, extract_ticker(msg.content), link,
+                   extract_risk(msg.content), extract_entry(msg.content),
+                   extract_sl(msg.content), extract_tp(msg.content),
+                   '', '', '$', '0']
+            sheet.append_row(row)
+            await msg.channel.send(f'✅ Идея сохранена ({msg.author.name})', delete_after=10)
+            return
+
+                # 2) Результат
+        elif is_result:
+            # Результат должен быть reply на идею
+            if not (msg.reference and msg.reference.message_id):
+                await msg.channel.send(
+                    f"{msg.author.mention} ❌ Чтобы отправить результат, ответьте на сообщение с идеей.",
+                    delete_after=30
+                )
+                return
+            # Проверка формата: отсутствие $
+            if xp == 'NO_DOLLAR':
+                await msg.channel.send(
+                    f"{msg.author.mention} ❌ Неверный формат результата! Обязательно указывайте символ $ (например: win 5$, lose -10$, be 0$).",
+                    delete_after=30
+                )
+                return
+            # Поиск строки идеи и обновление
+            rep = str(msg.reference.message_id)
+            rows = sheet.get_all_values()
+            idx = next((i+2 for i,r in enumerate(rows[1:]) if len(r)>3 and r[3].endswith(rep)), None)
+            if idx:
+                current = sheet.row_values(idx) + ['']*12
+                current[8] = link
+                if xp not in (None, 'NO_DOLLAR'):
+                    current[9], current[10] = str(xp), sym
+                sheet.update(range_name=f'A{idx}:L{idx}', values=[current[:12]])
+
+            return
+
+        # 3) Апдейт
+        elif is_update:
+            # Обязательно reply на сообщение-идею
+            if not (msg.reference and msg.reference.message_id):
+                await msg.channel.send(
+                    f"{msg.author.mention} ❌ Чтобы обновить идею, ответьте на исходное сообщение.",
+                    delete_after=30
+                )
+                return
+            await msg.channel.send(f'✅ Апдейт принят ({msg.author.name})', delete_after=5)
+            return
+
+        # 4) Неверный формат
+        else:
+            await msg.channel.send(
+                f"{msg.author.mention} ❌ Придерживайтесь формата сообщений!", delete_after=10
             )
-            # Додавання відповідей до опросу
-            poll.add_answer(text="Так")
-            poll.add_answer(text="Ні")
-            poll.add_answer(text="Скіпнув")
+            return
+    except Exception:
+        on_message_message_error_cleanup(msg)
 
-            # Варіант 1: Опрос як відповідь на повідомлення
-            await message.reply(content="Ви заробили на цьому кейсі?", poll=poll)
-            logging.info(f'Опрос створено як відповідь на повідомлення {message.id}')
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def export(ctx):
+    status = await ctx.send('⏳ Экспорт...')
+    try:
+        ws = client.open(GOOGLE_SHEET_NAME).sheet1
+        ensure_headers(ws)
 
-        except discord.Forbidden:
-            await message.channel.send("Помилка: у мене недостатньо прав для створення опросу.")
-            logging.error(f'Недостатньо прав для створення опросу в каналі {message.channel.id}')
-        except Exception as e:
-            await message.channel.send("Виникла помилка при створенні опросу.")
-            logging.error(f'Помилка при створенні опросу: {str(e)}')
+        # 1) Сбор завершённых опросов
+        polls_data = {}
+        now = datetime.now(timezone.utc)
+        def get_votes(ans):
+            for attr in ('votes','count','votes_count','vote_count'):
+                if hasattr(ans, attr):
+                    return getattr(ans, attr)
+            return len(getattr(ans, 'voters', []))
+        async for m in ctx.channel.history(limit=None, oldest_first=True):
+            if m.author.bot and m.poll and m.poll.expires_at <= now and m.reference:
+                polls_data[str(m.reference.message_id)] = sum(
+                    get_votes(a) for a in m.poll.answers if a.text == 'Так'
+                )
 
-    # Обробка команд (якщо будуть додані)
-    await bot.process_commands(message)
+        # 2) Сбор всех идей и результатов
+        # Получаем текущие строки после заголовка
+        all_rows = ws.get_all_values()[1:]
+        existing_links = {r[3] for r in all_rows if len(r) > 3 and r[3]}
 
-# Запуск бота
-if __name__ == "__main__":
-    if not TOKEN or not CHANNEL_ID:
-        logging.error("Токен бота або ID каналу не вказані в .env файлі")
-    else:
-        bot.run(TOKEN)
+        new_rows = []
+        updates = []
+        async for m in ctx.channel.history(limit=None, oldest_first=True):
+            if m.author.bot or m.content.startswith('!'):
+                continue
+            link = f'https://discord.com/channels/{m.guild.id}/{m.channel.id}/{m.id}'
+            low = m.content.lower()
+            is_idea = bool(re.search(r'\b(entry|твх|risk|риск)\b', low))
+            is_result = bool(re.search(r'\b(win|lose|be|close)\b', low))
+            if is_idea and link not in existing_links:
+                new_rows.append([
+                    m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                    m.author.name,
+                    extract_ticker(m.content),
+                    link,
+                    extract_risk(m.content),
+                    extract_entry(m.content),
+                    extract_sl(m.content),
+                    extract_tp(m.content),
+                    '', '', '$', '0'
+                ])
+            elif is_result and m.reference:
+                xp_val, sym_val = extract_xp(m.content)
+                yes = str(polls_data.get(str(m.id), 0))
+                updates.append((str(m.reference.message_id), link, xp_val, sym_val, yes))
+
+        # 3) Добавляем новые идеи одним запросом
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option='USER_ENTERED')
+
+        # 4) Обновляем результаты батчем
+        # Пересобираем mapping после добавления новых идей
+        all_rows = ws.get_all_values()[1:]
+        link_to_idx = {r[3].split('/')[-1]: idx+2 for idx, r in enumerate(all_rows) if len(r)>3 and r[3]}
+
+        batch = []
+        for ref_id, link, xp_val, sym_val, yes in updates:
+            idx = link_to_idx.get(ref_id)
+            if not idx:
+                continue
+            current = ws.row_values(idx) + ['']*12
+            current[8] = link
+            current[11] = yes
+            if xp_val not in (None, 'NO_DOLLAR'):
+                current[9] = str(xp_val)
+                current[10] = sym_val or ''
+            batch.append({'range': f'A{idx}:L{idx}', 'values': [current[:12]]})
+        if batch:
+            ws.batch_update(batch)
+
+        await status.edit(content='✅ Экспорт завершен.')
+    except Exception as e:
+        logger.error(f'Ошибка экспорта: {e}')
+        await status.delete()
+
+if __name__ == '__main__':
+    bot.run(TOKEN)
